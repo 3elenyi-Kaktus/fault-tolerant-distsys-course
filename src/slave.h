@@ -5,6 +5,7 @@
 #include <iostream>
 #include <thread>
 #include <cstring>
+#include <syncstream>
 
 enum {
     BROADCAST_PORT = 33333,
@@ -12,9 +13,14 @@ enum {
     PING_PORT = 33001
 };
 
+struct Config {
+    std::string address;
+    int drop_rate;
+};
+
 class Slave {
 public:
-    explicit Slave(const std::string& address);
+    explicit Slave(Config& config);
 
     void findMaster();
 
@@ -25,5 +31,6 @@ public:
     void serveRequests(int fd, sockaddr_in master_address);
 
     sockaddr_in address_;
-    std::string host_;
+    Config config_;
+    bool connected_;
 };
