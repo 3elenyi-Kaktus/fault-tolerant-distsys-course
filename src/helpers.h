@@ -5,6 +5,7 @@
 #include <string>
 #include <iostream>
 #include <vector>
+#include <syncstream>
 
 enum {
     BUFFER_SIZE = 1024,
@@ -30,4 +31,4 @@ std::string getMessage(int fd);
 
 bool sendMessageTo(int fd, const std::string& message, sockaddr_in address);
 
-std::pair<std::string, sockaddr_in> getMessageFrom(int fd);
+std::pair<std::string, sockaddr_in> getMessageFrom(int fd, int flags = 0);
