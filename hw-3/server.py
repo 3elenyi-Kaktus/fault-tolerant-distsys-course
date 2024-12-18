@@ -7,23 +7,25 @@ from threading import Thread, Lock
 from time import sleep
 from typing import Any, Callable, Optional
 
+from timer import Timer
+
 SERVERS = {
-    2: ("127.0.0.2", 32000),
-    3: ("127.0.0.3", 32000),
-    4: ("127.0.0.4", 32000),
+    "0": ("127.0.0.2", 32000),
+    "1": ("127.0.0.3", 32000),
+    "2": ("127.0.0.4", 32000),
 }
 
 
 class Timestamps:
-    def __init__(self, server_ids: list[int]) -> None:
-        self.timestamps: dict[int, int] = {}
+    def __init__(self, server_ids: list[str]) -> None:
+        self.timestamps: dict[str, int] = {}
         for server_id in server_ids:
             self.timestamps[server_id] = 0
 
-    def __getitem__(self, server_id: int) -> int:
+    def __getitem__(self, server_id: str) -> int:
         return self.timestamps[server_id]
 
-    def __setitem__(self, server_id: int, timestamp: int) -> None:
+    def __setitem__(self, server_id: str, timestamp: int) -> None:
         self.timestamps[server_id] = timestamp
 
     def __lt__(self, other):
@@ -57,72 +59,75 @@ class MessageType(IntEnum):
 
 
 class Message:
-    def __init__(self, type_: MessageType, sender: int, timestamps: Timestamps, data: Any) -> None:
+    def __init__(self, type_: MessageType, sender: str, id_: tuple[str, int], timestamps: Timestamps, data: Any) -> None:
         self.type: MessageType = type_
-        self.id: tuple[int, int] = sender, timestamps[sender]
-        self.sender: int = sender
+        self.id: tuple[str, int] = id_
+        self.sender: str = sender
         self.timestamps: Timestamps = timestamps
         self.data: Any = data
 
-    def encode(self) -> bytes:
-        return json.dumps({
-            'type': self.type.value,
-            'id': self.id,
-            'timestamps': self.timestamps,
-            'data': self.data
-        }).encode('utf-8')
-
     @staticmethod
-    def decode(buffer: bytes):
-        message = json.loads(buffer.decode('utf-8'))
+    def decode(message: Any):
         type_ = MessageType(message['type'])
-        id_ = message['id']
+        sender = message['sender']
+        id_ = tuple(message['id'])
         timestamps = message['timestamps']
+        tmp = Timestamps([])
+        tmp.timestamps = timestamps
         data = message['data']
-        return Message(type_, id_, timestamps, data)
+        return Message(type_, sender, id_, tmp, data)
 
     def __json__(self):
         return {
             'type': self.type.value,
-            'id': self.id,
             'sender': self.sender,
+            'id': self.id,
             'timestamps': self.timestamps,
             'data': self.data
         }
 
 
 class ReliableCausalBroadcast:
-    def __init__(self, id_: int, delivery_callback: Callable):
-        self.id: int = id_
-        self.servers: dict[int, tuple[str, int]] = SERVERS
+    def __init__(self, id_: str, delivery_callback: Callable):
+        self.id: str = id_
+        self.servers: dict[str, tuple[str, int]] = SERVERS
         self.ct: int = 0
-        self.pending: list[tuple[int, int]] = []
-        self.delivered: list[tuple[int, int]] = []
-        self.acks: dict[tuple[int, int], set[int]] = {}
-        self.mapping: dict[tuple[int, int], Message] = {}
+        self.pending: list[tuple[str, int]] = []
+        self.delivered: list[tuple[str, int]] = []
+        self.acks: dict[tuple[str, int], set[str]] = {}
+        self.mapping: dict[tuple[str, int], Message] = {}
         self.timestamps: Timestamps = Timestamps(list(self.servers.keys()))
         self.delivery_callback: Callable = delivery_callback
+        self.timers: dict[tuple[str, int], Timer] = {}
         self.lock = Lock()
+
         Thread(target=self._pollMessages).start()
 
     def _broadcast(self, message: Message):
         logging.info(f"BROADCAST -> {json.dumps(message)}")
-        message = message.encode()
+        self_send = message.type == MessageType.EVENT
+        message = json.dumps(message).encode('utf-8')
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         for server_id, address in self.servers.items():
-            if server_id == self.id:
+            if server_id == self.id and not self_send:
                 continue
             n = sock.sendto(message, address)
             if n != len(message):
                 logging.critical(f"Datagram split: {n} sent instead of {len(message)}")
 
-    def broadcastMessage(self, message_type: MessageType, data: Any) -> tuple[int, int]:
+    def broadcastMessage(self, message_type: MessageType, data: Any) -> tuple[str, int]:
         with self.lock:
             self.ct += 1
             tmp: Timestamps = copy.deepcopy(self.timestamps)
             tmp[self.id] = self.ct
-            message = Message(message_type, self.id, tmp, data)
-        self._broadcast(message)
+            message = Message(message_type, self.id, (self.id, tmp[self.id]), tmp, data)
+            self._broadcast(message)
+            if message_type == MessageType.EVENT:
+                self.mapping[message.id] = message
+                self.pending += [message.id]
+                self.acks[message.id] = set()
+                self.timers[message.id] = Timer('MSG BRDCST RPT', 10, self.on_timer, message.id, renewable=True)
+                self.timers[message.id].start()
         return message.id
 
     def _pollMessages(self):
@@ -138,7 +143,8 @@ class ReliableCausalBroadcast:
                 except socket.timeout:
                     logging.info("")
                     continue
-                message = Message.decode(message)
+
+                message = Message.decode(json.loads(message.decode('utf-8')))
                 logging.info(f"RECEIVE <- {json.dumps(message)}")
                 if message.type == MessageType.EVENT:
                     self._processMessage(message)
@@ -148,62 +154,75 @@ class ReliableCausalBroadcast:
             logging.exception(exception)
 
     def _processMessage(self, message: Message):
-        if message.id not in self.mapping.keys():
-            self.mapping[message.id] = message
-            self.acks[message.id] = {message.sender}
-        else:
-            self.acks[message.id].add(message.sender)
-        if message.id not in self.pending and message.id not in self.delivered:
-            self.pending += [message.id]
-            if message.sender != self.id:
-                self._broadcast(message)
+        with self.lock:
+            if message.id not in self.mapping.keys():
+                self.mapping[message.id] = message
+                self.acks[message.id] = {message.sender}
+                self.pending += [message.id]
+                if message.sender != self.id:
+                    msg = copy.deepcopy(message)
+                    msg.sender = self.id
+                    self._broadcast(msg)
+            else:
+                self.acks[message.id].add(message.sender)
         self._deliver()
 
     def _deliver(self):
         delivered = False
-        for message_id in self.pending:
-            message: Message = self.mapping[message_id]
-            if len(self.acks[message_id]) < (len(self.servers) + 1) / 2. or self.timestamps[message.sender] + 1 != \
-                    message.timestamps[message.sender]:
-                continue
-            deliverable = True
-            for server_id in self.servers.keys():
-                if server_id != message.sender and self.timestamps[server_id] < message.timestamps[server_id]:
-                    deliverable = False
-                    break
-            if not deliverable:
-                continue
+        with self.lock:
+            for message_id in self.pending:
+                message: Message = self.mapping[message_id]
+                if len(self.acks[message_id]) < (len(self.servers) + 1) / 2. or self.timestamps[message.sender] + 1 != \
+                        message.timestamps[message.sender]:
+                    continue
+                deliverable = True
+                for server_id in self.servers.keys():
+                    if server_id != message.sender and self.timestamps[server_id] < message.timestamps[server_id]:
+                        deliverable = False
+                        break
+                if not deliverable:
+                    continue
 
-            self.delivery_callback(message)
+                logging.info(f"DELIVERED -> {json.dumps(message)}")
+                self.delivery_callback(message)
 
-            delivered = True
-            self.delivered += [message_id]
-            self.pending.remove(message_id)
-            with self.lock:
+                delivered = True
+                self.delivered += [message_id]
+                self.pending.remove(message_id)
+                timer = self.timers.pop(message_id, None)
+                if timer:
+                    timer.cancel()
                 self.timestamps[message.sender] += 1
-            break
+                break
         if delivered:
             self._deliver()
 
-    # def on_timer(self, timer_name: str):
-    #     pass
+    def on_timer(self, message_id: tuple[str, int]):
+        logging.info(f"TIMER -> {message_id}")
+        with self.lock:
+            if message_id in self.pending:
+                self._broadcast(self.mapping[message_id])
+            else:
+                timer = self.timers.pop(message_id, None)
+                if timer:
+                    timer.cancel()
 
     def __json__(self):
         return {
             'id': self.id,
             'ct': self.ct,
-            'pending': self.pending,
-            'delivered': self.delivered,
-            'acks': self.acks,
-            'mapping': self.mapping,
+            'pending': [str(x) for x in self.pending],
+            'delivered': [str(x) for x in self.delivered],
+            'acks': {str(k): list(v) for k, v in self.acks.items()},
+            'mapping': {str(k): v for k, v in self.mapping.items()},
             'timestamps': self.timestamps,
         }
 
 
 class Storage:
     def __init__(self):
-        self.inserts: dict[str, tuple[int, Timestamps, int]] = {}
-        self.removes: dict[str, tuple[int, Timestamps]] = {}
+        self.inserts: dict[str, tuple[str, Timestamps, int]] = {}
+        self.removes: dict[str, tuple[str, Timestamps]] = {}
         self.lock = Lock()
 
     def get(self, key: str) -> Optional[int]:
@@ -217,7 +236,7 @@ class Storage:
             return None
         return last_insert[2]
 
-    def put(self, key: str, value: int, sender: int, timestamps: Timestamps):
+    def put(self, key: str, value: int, sender: str, timestamps: Timestamps):
         last_insert = self.inserts.get(key, None)
         if last_insert:
             current_sender, current_timestamps, _ = last_insert
@@ -226,7 +245,7 @@ class Storage:
         with self.lock:
             self.inserts[key] = (sender, timestamps, value)
 
-    def delete(self, key: str, sender: int, timestamps: Timestamps):
+    def delete(self, key: str, sender: str, timestamps: Timestamps):
         last_remove = self.removes.get(key, None)
         if last_remove:
             current_sender, current_timestamps = last_remove
@@ -262,24 +281,25 @@ class Storage:
         }
 
 class Server:
-    def __init__(self, server_id: int) -> None:
-        self.id: int = server_id
+    def __init__(self, server_id: str) -> None:
+        self.id: str = server_id
         self.network = ReliableCausalBroadcast(self.id, self.on_message_delivery)
         self.storage: Storage = Storage()
+        self.storage_lock = Lock()
 
         Thread(target=self.syncer).start()
 
 
     def syncer(self):
         while True:
-            self.network._broadcast(Message(MessageType.SYNC, self.id, {self.id: 0}, self.storage.to_json()))
+            self.network._broadcast(Message(MessageType.SYNC, self.id, (self.id, -1), None, self.storage.to_json()))
             sleep(10)
 
     def on_get(self, key: str) -> Optional[int]:
         return self.storage.get(key)
 
-    def on_patch(self, pairs: list[tuple[str, Optional[int]]]) -> None:
-        message_id: tuple[int, int] = self.network.broadcastMessage(MessageType.EVENT, pairs)
+    def on_patch(self, pairs: dict[str, Optional[int]]) -> None:
+        message_id: tuple[str, int] = self.network.broadcastMessage(MessageType.EVENT, pairs)
         # while not message_id in self.network.delivered:
         #     sleep(1)
 
@@ -292,12 +312,13 @@ class Server:
                     else:
                         self.storage.put(key, value, message.sender, message.timestamps)
             case MessageType.SYNC:
+                logging.info("Server received SYNC message, merge storages")
                 storage: Storage = Storage()
                 storage.from_json(message.data)
                 self.merge_storage(storage)
 
     def merge_storage(self, storage: Storage):
-        with self.storage.lock:
+        with self.storage_lock:
             for key, value in storage.inserts.items():
                 self.storage.put(key, value[2], value[0], value[1])
             for key, value in storage.removes.items():

@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 
 class CRDTRequest(BaseModel):
-    data: list[tuple[str, Optional[int]]] = field(default_factory=list)
+    data: dict[str, Optional[int]] = field(default_factory=dict)
 
 
 class CRDTResponse(BaseModel):

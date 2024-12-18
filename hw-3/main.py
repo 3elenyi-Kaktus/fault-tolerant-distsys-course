@@ -31,7 +31,7 @@ async def lifespan(app):
     if len(sys.argv) < 2:
         raise RuntimeError("Not enough arguments\nUsage: python main.py <server_id>")
     logging.info(f"Starting server with ID: {sys.argv[2]}")
-    server = Server(int(sys.argv[2]))
+    server = Server(sys.argv[2])
     yield
     print("Shutdown")
 
@@ -61,7 +61,7 @@ async def get_value(key: str):
 @app.patch("/storage")
 async def add_value(request: CRDTRequest):
     logging.info(f"App: Got request: {request}")
-    _: int = server.on_patch(request)
+    _: int = server.on_patch(request.data)
     return CRDTResponse(value="OK")
 
 
